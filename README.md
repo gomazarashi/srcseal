@@ -1,5 +1,7 @@
 # srcseal
 
+[![test](https://github.com/gomazarashi/srcseal/actions/workflows/test.yml/badge.svg)](https://github.com/gomazarashi/srcseal/actions)
+
 `srcseal` creates a ZIP archive from the current Git working tree.
 
 Which files to include is decided by Git itself: existing tracked files plus
