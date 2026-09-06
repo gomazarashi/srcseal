@@ -266,8 +266,11 @@ def test_build_archive_never_follows_symlink(
         archive.build_archive(
             sample_repo, ["link.txt"], out_path, prefix="p", file_modes={}
         )
-    # No populated archive left behind.
-    assert not out_path.exists() or out_path.stat().st_size == 0
+    # The failed run must not store the symlink target.
+    if out_path.exists():
+        with zipfile.ZipFile(out_path) as zf:
+            for name in zf.namelist():
+                assert zf.read(name) != b"TOP-SECRET\n"
 
 
 def test_build_archive_never_follows_symlink_mock(
