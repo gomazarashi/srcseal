@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "srcseal"
+version = "0.1.0"
+description = "Create a ZIP archive from the current Git working tree"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "gomazarashi" }]
+keywords = ["git", "archive", "zip"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+srcseal = "srcseal.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/srcseal"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
