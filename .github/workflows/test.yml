@@ -17,5 +17,9 @@ jobs:
           python-version: "3.13"
       - name: Install project and test dependencies
         run: pip install -e .[test]
+      - name: Lint with Ruff
+        run: |
+          pip install ruff
+          ruff check src tests
       - name: Run tests
         run: pytest
