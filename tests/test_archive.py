@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -267,10 +269,8 @@ def test_build_archive_never_follows_symlink(
             sample_repo, ["link.txt"], out_path, prefix="p", file_modes={}
         )
     # The failed run must not store the symlink target.
-    if out_path.exists():
-        with zipfile.ZipFile(out_path) as zf:
-            for name in zf.namelist():
-                assert zf.read(name) != b"TOP-SECRET\n"
+    assert not out_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_build_archive_never_follows_symlink_mock(
@@ -308,3 +308,119 @@ def test_timestamp_format() -> None:
     assert ts[:8].isdigit() and ts[9:].isdigit()
     # Valid month.
     assert 1 <= int(ts[4:6]) <= 12
+
+
+def test_build_archive_leaves_no_partial_on_mid_run_failure(
+    sample_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_read_bytes = Path.read_bytes
+    calls = {"count": 0}
+
+    def flaky_read_bytes(self: Path) -> bytes:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("disk exploded")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
+    out_path = tmp_path / "partial.zip"
+    with pytest.raises(archive.ArchiveError, match="cannot read file"):
+        archive.build_archive(
+            sample_repo,
+            ["tracked.py", "untracked.md"],
+            out_path,
+            prefix="p",
+            file_modes={},
+        )
+    assert not out_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_build_archive_rejects_non_utf8_encodable_name(
+    sample_repo: Path, tmp_path: Path
+) -> None:
+    # Surrogate names arise from non-UTF-8 bytes on a POSIX filesystem.
+    out_path = tmp_path / "badname.zip"
+    with pytest.raises(archive.ArchiveError, match="UTF-8"):
+        archive.build_archive(
+            sample_repo, ["a/\udcff.txt"], out_path, prefix="p", file_modes={}
+        )
+    assert not out_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs undecodable POSIX bytes names")
+def test_build_archive_rejects_real_non_utf8_filename(
+    tmp_path: Path,
+) -> None:
+    from tests.conftest import init_repo
+
+    repo = init_repo(tmp_path / "bytes-repo")
+    raw_name = b"\xff\xfe undecodable.bin"
+    fd = os.open(os.path.join(os.fsencode(str(repo)), raw_name), os.O_CREAT | os.O_WRONLY)
+    os.write(fd, b"data\n")
+    os.close(fd)
+    subprocess.run(
+        [b"git", b"add", raw_name], cwd=repo, check=True, capture_output=True
+    )
+    names = archive.list_archive_files(repo)
+    assert len(names) == 1  # git bytes survive until the ZIP boundary
+    out_path = tmp_path / "badname.zip"
+    with pytest.raises(archive.ArchiveError, match="UTF-8"):
+        archive.build_archive(repo, names, out_path, prefix="p", file_modes={})
+    assert not out_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../escape",
+        "..\\evil.txt",
+        "dir\\..\\evil.txt",
+        "C:\\evil.txt",
+        "C:foo",
+        "\\\\server\\share\\evil",
+        "\\rooted.txt",
+        "/abs.txt",
+    ],
+)
+def test_build_archive_rejects_cross_platform_unsafe_paths(
+    sample_repo: Path, tmp_path: Path, bad: str
+) -> None:
+    out_path = tmp_path / "unsafe.zip"
+    with pytest.raises(archive.ArchiveError, match="unsafe"):
+        archive.build_archive(
+            sample_repo, [bad], out_path, prefix="p", file_modes={}
+        )
+    assert not out_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_build_archive_allows_interior_backslash_and_colon(
+    sample_repo: Path, tmp_path: Path
+) -> None:
+    # Legal POSIX names; only absolute/traversal forms are rejected.
+    # The files do not exist, so nothing is stored, but no error is raised.
+    out_path = tmp_path / "allowed.zip"
+    count = archive.build_archive(
+        sample_repo,
+        ["foo\\bar.txt", "foo:bar.txt", "..foo"],
+        out_path,
+        prefix="p",
+        file_modes={},
+    )
+    assert count == 0
+    with zipfile.ZipFile(out_path) as zf:
+        assert zf.namelist() == []
+
+
+def test_run_git_reports_missing_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing_git(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(archive.subprocess, "run", missing_git)
+    with pytest.raises(archive.ArchiveError, match="not found on PATH"):
+        archive._run_git(tmp_path, "rev-parse", "--show-toplevel")

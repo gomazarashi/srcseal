@@ -423,6 +423,20 @@ def test_main_rejects_missing_path(tmp_path: Path) -> None:
     assert cli.main([str(tmp_path / "missing")]) == 1
 
 
+def test_main_reports_missing_git_without_traceback(
+    sample_repo: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setenv("PATH", "")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    assert cli.main([str(sample_repo), "--output-dir", str(out_dir)]) == 1
+    captured = capsys.readouterr()
+    assert "not found on PATH" in captured.err
+    assert "Traceback" not in captured.err and "Traceback" not in captured.out
+    assert _zips_in(out_dir) == []
+
+
 def test_python_module_entrypoint_shows_help() -> None:
     # returncode is asserted below.
     proc = subprocess.run(  # noqa: PLW1510

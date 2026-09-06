@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import tempfile
 import time
 import zipfile
 from datetime import UTC, datetime
@@ -15,14 +16,25 @@ class ArchiveError(RuntimeError):
     """Raised when the archive cannot be created."""
 
 
+class GitNotFoundError(ArchiveError):
+    """Raised when the git executable is missing from PATH."""
+
+
 def _run_git(repo: Path, *args: str) -> bytes:
     """Run git in *repo*; return raw stdout (bytes-safe paths)."""
-    completed = subprocess.run(
-        ("git", *args),
-        cwd=repo,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ("git", *args),
+            cwd=repo,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        # A clear CLI error instead of a traceback.
+        raise GitNotFoundError(
+            "git was not found on PATH "
+            "(install git and ensure it is available on PATH)"
+        ) from None
     if completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="replace").strip()
         joined = " ".join(args)
@@ -35,6 +47,8 @@ def find_repo_root(start: Path) -> Path:
     """Return the top-level directory of the repository containing *start*."""
     try:
         output = _run_git(start, "rev-parse", "--show-toplevel")
+    except GitNotFoundError:
+        raise
     except ArchiveError:
         raise ArchiveError(f"not a git repository: {start}") from None
     # rev-parse prints one line.
@@ -151,7 +165,11 @@ def timestamp_now() -> str:
 
 
 def _check_safe_relative_path(rel: str) -> None:
-    """Reject archive entries that could escape the target directory."""
+    """Reject archive entries that could escape the target directory.
+
+    Both separators count: a name legal on Linux (e.g. ``..\\evil.txt``)
+    can act as traversal when the ZIP is extracted on Windows.
+    """
     if not rel or rel in (".", ".."):
         raise ArchiveError(f"refusing unsafe path from git: {rel!r}")
     posix = PurePosixPath(rel)
@@ -159,6 +177,28 @@ def _check_safe_relative_path(rel: str) -> None:
         raise ArchiveError(f"refusing unsafe absolute path from git: {rel!r}")
     if ".." in posix.parts:
         raise ArchiveError(f"refusing unsafe path from git: {rel!r}")
+    windows = PureWindowsPath(rel)
+    # Drive-absolute (C:\...), UNC (\\server\...), or rooted (\...).
+    # Rooted paths lack a drive, so is_absolute() alone misses them.
+    if windows.is_absolute() or rel.startswith("\\"):
+        raise ArchiveError(f"refusing unsafe absolute path from git: {rel!r}")
+    if len(rel) >= 2 and rel[0].isalpha() and rel[1] == ":":
+        # Drive-relative (C:foo); is_absolute() misses it.
+        raise ArchiveError(f"refusing unsafe path from git: {rel!r}")
+    if ".." in windows.parts:
+        raise ArchiveError(f"refusing unsafe path from git: {rel!r}")
+
+
+def _check_zip_encodable(arcname: str, rel: str) -> None:
+    """Reject names zipfile cannot store instead of leaking a traceback."""
+    try:
+        arcname.encode("utf-8")
+    except UnicodeEncodeError:
+        # Never sanitize: say which file, in printable form.
+        shown = rel.encode("utf-8", "backslashreplace").decode("ascii")
+        raise ArchiveError(
+            f"cannot store filename in ZIP (not UTF-8 encodable): {shown}"
+        ) from None
 
 
 def build_archive(
@@ -178,45 +218,71 @@ def build_archive(
         raise ArchiveError(f"output directory does not exist: {out_path.parent}")
 
     modes = file_modes if file_modes is not None else {}
-    count = 0
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for rel in relative_paths:
-            _check_safe_relative_path(rel)
-            full = repo_root / rel
-            # Never follow symlinks.
-            try:
-                if full.is_symlink():
+    # Stage in a temp file: a mid-run failure must not leave a partial ZIP.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{out_path.name}.", suffix=".tmp", dir=out_path.parent
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        count = 0
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for rel in relative_paths:
+                _check_safe_relative_path(rel)
+                arcname = f"{prefix}/{rel}" if prefix else rel
+                _check_zip_encodable(arcname, rel)
+                full = repo_root / rel
+                # Never follow symlinks.
+                try:
+                    if full.is_symlink():
+                        raise ArchiveError(
+                            f"refusing to follow symlink during archiving: {rel}"
+                        )
+                    if not full.is_file():
+                        continue
+                except OSError as exc:
                     raise ArchiveError(
-                        f"refusing to follow symlink during archiving: {rel}"
-                    )
-                if not full.is_file():
-                    continue
-            except OSError as exc:
-                raise ArchiveError(f"cannot read file for archiving: {rel}: {exc}") from exc
-            try:
-                data = full.read_bytes()
-                file_stat = full.stat()
-            except OSError as exc:
-                raise ArchiveError(f"cannot read file for archiving: {rel}: {exc}") from exc
+                        f"cannot read file for archiving: {rel}: {exc}"
+                    ) from exc
+                try:
+                    data = full.read_bytes()
+                    file_stat = full.stat()
+                except OSError as exc:
+                    raise ArchiveError(
+                        f"cannot read file for archiving: {rel}: {exc}"
+                    ) from exc
 
-            git_mode = modes.get(rel)
-            if git_mode == "100755":
-                unix_mode = 0o755
-            elif git_mode is not None:
-                unix_mode = 0o644
-            else:
-                # Git has no mode for untracked files; use the filesystem bit.
-                unix_mode = 0o755 if (file_stat.st_mode & 0o111) else 0o644
+                git_mode = modes.get(rel)
+                if git_mode == "100755":
+                    unix_mode = 0o755
+                elif git_mode is not None:
+                    unix_mode = 0o644
+                else:
+                    # Git has no mode for untracked files; use the filesystem bit.
+                    unix_mode = 0o755 if (file_stat.st_mode & 0o111) else 0o644
 
-            arcname = f"{prefix}/{rel}" if prefix else rel
-            info = zipfile.ZipInfo(
-                filename=arcname,
-                date_time=time.localtime(file_stat.st_mtime)[:6],
-            )
-            info.create_system = 3  # Unix: unzip honors the mode bits.
-            info.compress_type = zipfile.ZIP_DEFLATED
-            # Upper 16 bits hold the Unix file mode.
-            info.external_attr = (stat.S_IFREG | unix_mode) << 16
-            archive.writestr(info, data)
-            count += 1
+                info = zipfile.ZipInfo(
+                    filename=arcname,
+                    date_time=time.localtime(file_stat.st_mtime)[:6],
+                )
+                info.create_system = 3  # Unix: unzip honors the mode bits.
+                info.compress_type = zipfile.ZIP_DEFLATED
+                # Upper 16 bits hold the Unix file mode.
+                info.external_attr = (stat.S_IFREG | unix_mode) << 16
+                archive.writestr(info, data)
+                count += 1
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    if out_path.exists():
+        # Re-check: never overwrite, even if the file appeared mid-run.
+        tmp_path.unlink(missing_ok=True)
+        raise ArchiveError(
+            f"output file already exists (will not overwrite): {out_path}"
+        )
+    try:
+        os.replace(tmp_path, out_path)
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise ArchiveError(f"cannot write output file: {out_path}: {exc}") from exc
     return count

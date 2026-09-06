@@ -4,15 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "srcseal"
-version = "0.1.0"
+version = "0.1.1"
 description = "Create a ZIP archive from the current Git working tree"
 readme = "README.md"
 requires-python = ">=3.13"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "gomazarashi" }]
 keywords = ["git", "archive", "zip"]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
